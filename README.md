@@ -1,15 +1,15 @@
 # OwlPilot 🦉
 
-**A personal academic co-pilot for D2L Brightspace.** OwlPilot reads your courses from D2L (read-only), then gives you:
+**A personal academic co-pilot for any school on D2L Brightspace.** OwlPilot reads your courses from D2L (read-only, through [d2l-cli](https://github.com/Aaryan-Kapoor/d2l-cli)), then gives you:
 
 - a calendar of every due date,
 - a mistake log built from graded work below 80%,
 - per-course grade overviews,
 - review guides that cite your actual course data.
 
-It runs entirely on your own computer. The page is hosted by **[It](https://github.com/Aaryan-Kapoor/it)**, which also stores everything in a local database. A small Python worker handles every button click in the background.
+It runs entirely on your own computer, and with [Tailscale](#use-on-any-screen-tailscale) you can open it on your phone, tablet or any other screen you own. The page is hosted by **[It](https://github.com/Aaryan-Kapoor/it)**, which also stores everything in a local database. A small Python worker handles every button click in the background.
 
-> Built for Kennesaw State University's D2L (`kennesaw.view.usg.edu`). Other schools on D2L Brightspace can use it by setting one environment variable (see [Using another school's D2L](#using-another-schools-d2l)).
+> Works at any Brightspace school. Kennesaw State and Georgia State are one-click presets; for any other school, enter its D2L address in Settings.
 
 ---
 
@@ -40,13 +40,13 @@ It runs entirely on your own computer. The page is hosted by **[It](https://gith
                        button clicks│ & page state
                                    ▼
                        OwlPilot worker (Python)
-                         ├─ D2L: you sign in once; reads via D2L's own API (GET only)
+                         ├─ D2L via d2l-cli: sign in once; token refreshes itself (GET only)
                          └─ Review guides: written by Claude Code from cited course data
 ```
 
 1. **It** shows the OwlPilot page and stores its data. It only answers on this computer.
 2. When you click a button, the page sends an *action* to It. The **worker** picks it up within about 2 seconds, validates it, does the work, and saves the result back. The page then updates by itself.
-3. For **D2L**, a browser window opens and you sign in yourself, including SSO and Duo. Your login session is saved in `data/d2l/session.json` on your computer, and OwlPilot uses it only to *read* your courses.
+3. For **D2L**, OwlPilot uses [d2l-cli](https://github.com/Aaryan-Kapoor/d2l-cli). A browser window opens and you sign in yourself, including SSO and Duo. d2l-cli captures D2L's short-lived API token into `~/.d2l/` and, when it expires, renews it silently from the saved browser session, so you sign in about once per device instead of whenever a cookie dies. Every request is a GET.
 
 ## Requirements
 
@@ -119,7 +119,7 @@ See [Pairing your browser](#pairing-your-browser) below. You do this once per br
 ### 5. Open OwlPilot and connect D2L
 
 1. Open **http://localhost:4700/p/owlpilot**.
-2. Go to **Settings** and click **Sign in to D2L**.
+2. Go to **Settings**, choose your school (or paste your school's D2L address), then click **Sign in to D2L**.
 3. A browser window opens on your D2L. Sign in as you normally would. The window closes by itself once OwlPilot can read your courses, usually within a few seconds of finishing Duo.
 4. Your courses, due dates, grades and announcements appear. Look for **"D2L synced"** in the sidebar.
 
@@ -207,7 +207,11 @@ Run all of these from the `owlpilot` folder.
 | Run It alone | `IT_HOME="$PWD/.tools/it" .tools/it/bin/it serve` |
 | Run the worker alone | `.venv/bin/python -m owlpilot.worker` |
 | Process waiting clicks once, then exit | `.venv/bin/python -m owlpilot.worker --once` |
-| Sign in to D2L from the terminal | `.venv/bin/python -m owlpilot.d2l login` |
+| Choose your school | `.venv/bin/python -m owlpilot.d2l setup --school ksu` or `--host https://…` |
+| Sign in to D2L from the terminal | `.venv/bin/python -m owlpilot.d2l login` (or `.venv/bin/d2l login`) |
+| Diagnose D2L setup and sign-in | `.venv/bin/d2l doctor` |
+| Remote access on / off / status | `.venv/bin/python -m owlpilot.remote on` · `off` · `status` |
+| Pairing link for another device | `.venv/bin/python -m owlpilot.remote pair` |
 | Run tests | `.venv/bin/python -m unittest discover -s tests` |
 
 **Tip:** to type `it` instead of the full path in the current terminal, run:
@@ -228,9 +232,11 @@ export IT_HOME="$PWD/.tools/it"; export PATH="$IT_HOME/bin:$PATH"
 
 **"It is already running" / "worker is already running elsewhere".** That's fine: an earlier copy is still running, and `start.sh` won't start a duplicate. To start fresh, stop the other copy (Ctrl-C in its terminal), or run `pkill -f owlpilot.worker`.
 
-**D2L says "needs sign-in".** Your D2L session expired. Go to Settings → **Sign in to D2L**.
+**D2L says "needs sign-in".** OwlPilot renews the D2L token by itself. If it still asks, the saved browser session itself expired (usually after weeks), so go to Settings → **Sign in to D2L**. `.venv/bin/d2l doctor` shows exactly what's wrong.
 
-**The D2L sign-in window doesn't open.** Run `.venv/bin/python -m playwright install chromium`, then try again. To use your own browser instead, set `OWLPILOT_BROWSER` to its path, for example `export OWLPILOT_BROWSER="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"`.
+**Remote screen can't connect.** Both devices must be on the same Tailscale account, the OwlPilot computer must be awake, and the device must be paired (`python -m owlpilot.remote pair`).
+
+**The D2L sign-in window doesn't open.** d2l-cli tries Playwright's Chromium, then your installed Chrome or Edge. Run `.venv/bin/python -m playwright install chromium`, or sign in directly with `.venv/bin/d2l login`.
 
 **Review guide "Failed".** Read the reason shown on the page:
 
@@ -245,20 +251,33 @@ export IT_HOME="$PWD/.tools/it"; export PATH="$IT_HOME/bin:$PATH"
 
 ## Using another school's D2L
 
-Set the D2L address before starting:
+Any Brightspace school works. Pick it in **Settings → Choose your school**, or from a terminal:
 
 ```sh
-export OWLPILOT_D2L_URL="https://your-school.brightspace.com"
-./scripts/start.sh
+.venv/bin/python -m owlpilot.d2l setup --school ksu                               # preset
+.venv/bin/python -m owlpilot.d2l setup --host https://your-school.brightspace.com  # any school
 ```
 
-Due-date times are shown in `America/New_York`. To change this, edit `TZ` in `owlpilot/d2l.py`.
+The choice is stored in `~/.d2l/config.json` and shared with the `d2l` command, so `.venv/bin/d2l courses` works too. `D2L_HOST` (or the older `OWLPILOT_D2L_URL`) overrides it per run. Due dates are shown in this computer's time zone; set `OWLPILOT_TZ=America/Chicago` (any IANA name) to override.
+
+## Use on any screen (Tailscale)
+
+OwlPilot answers only the computer it runs on until you turn remote access on. With [Tailscale](https://tailscale.com) it becomes reachable from your own devices, and nobody else:
+
+1. Install Tailscale on the computer running OwlPilot and on your phone/tablet/other computer, and sign in to the **same** Tailscale account on each.
+2. In OwlPilot, **Settings → Use on any screen → Allow my Tailscale devices** (or `.venv/bin/python -m owlpilot.remote on`). This runs `it network tailscale`, so only your tailnet can connect, plus `it https on` for an `https://<machine>.<tailnet>.ts.net` address when HTTPS certificates are enabled in your Tailscale admin console.
+3. Pair each new device once: on the OwlPilot computer run `.venv/bin/python -m owlpilot.remote pair` and open the printed link on the device. The link works once and expires quickly.
+4. Open the address shown in Settings (e.g. `https://my-mac.tail1234.ts.net/p/owlpilot`). Add it to your home screen for an app-like view.
+
+Turn it off with **Back to this computer only** or `.venv/bin/python -m owlpilot.remote off`. Check what's reachable with `.venv/bin/python -m owlpilot.remote status`.
+
+The D2L sign-in window always opens on the computer running OwlPilot, not on the remote screen. Sign in there once; after that, token refresh needs no screen.
 
 ## Privacy and safety
 
-- **Everything stays on your computer.** It answers only on `localhost`, with network sharing off. Course data lives in It's database inside `.tools/it/` and in `data/`, and both are git-ignored.
+- **Everything stays on your computer.** It answers only on `localhost` unless you turn on remote access, and then only your Tailscale devices, each of which must be paired. Course data lives in It's database inside `.tools/it/` and in `data/`, and both are git-ignored.
 - **D2L is read-only.** OwlPilot only makes GET requests: courses, assignments, quizzes, announcements, released grades and content outline. It never submits, posts, opens quizzes, or changes anything.
-- **Your password is never seen.** You sign in to D2L yourself in a normal browser window. Only the resulting session cookie is saved, in `data/d2l/session.json` with owner-only permissions. **Never commit or share the `data/` folder.**
+- **Your password is never seen.** You sign in to D2L yourself in a normal browser window. d2l-cli saves the short-lived API token and the browser profile in `~/.d2l/`. **Never commit or share `~/.d2l/` or the `data/` folder.**
 - **AI use.** When you generate a review guide, relevant excerpts of that course's data are sent to the AI provider behind Claude Code (or your chosen agent). Nothing is sent otherwise.
 - **No graded work.** Guides are study aids with ungraded practice. OwlPilot will not write or submit assignments.
 
@@ -271,7 +290,8 @@ app/                 The OwlPilot page (vanilla HTML/CSS/JS) that It publishes
   style.css
 owlpilot/            Python package
   core.py            Validates every action; builds revision-checked patches for It's state
-  d2l.py             D2L sign-in and read-only sync; maps courses, due dates, grades and modules
+  d2l.py             D2L via d2l-cli: school setup, sign-in, read-only sync; maps courses, due dates, grades and modules
+  remote.py          Tailscale remote access (drives `it network tailscale` / `it https`) and pairing links
   worker.py          Background loop: takes actions from It, runs them, writes results back
   __main__.py        CLI: python -m owlpilot initial|handle|context|complete
 scripts/
@@ -290,7 +310,7 @@ owlpilot_academic_co_pilot.html   Original static design prototype (reference)
 ## Development and tests
 
 ```sh
-.venv/bin/python -m unittest discover -s tests     # 33 tests: validation, D2L mapping, guides
+.venv/bin/python -m unittest discover -s tests     # validation, D2L mapping, d2l-cli integration, remote access, guides
 ```
 
 After editing anything in `app/`, republish the page. Open browsers reload automatically:

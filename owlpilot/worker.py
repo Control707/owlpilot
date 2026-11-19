@@ -21,7 +21,7 @@ import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import d2l
+from . import d2l, remote
 from .core import ROOT, OwlPilotError, complete_guide, guide_context, handle_action, stamp, unpack_state
 
 PAGE = "owlpilot"
@@ -123,6 +123,10 @@ def handle(action):
         return sync_d2l(action)
     if kind == "d2l.login":
         return d2l_login(action)
+    if kind == "d2l.setup":
+        return d2l_setup(action, data)
+    if kind in ("remote.enable", "remote.disable"):
+        return set_remote(action, kind == "remote.enable")
     file_path = save_file(action) if kind == "course.import_file" else None
 
     def fn(doc):
@@ -137,25 +141,108 @@ def handle(action):
 
 
 def sync_d2l(action):
+    """Read D2L through d2l-cli. Expired tokens are refreshed silently; only a dead session asks for sign-in."""
     try:
         snapshot = d2l.collect()
+    except d2l.NeedsSetup as exc:
+        with_state(lambda doc: d2l.status_patch(doc, "needs_setup", str(exc), action["id"]))
+        log("d2l.sync: needs school setup")
+        return
     except d2l.NeedsLogin as exc:
         with_state(lambda doc: d2l.status_patch(doc, "needs_login", f"Sign in to D2L to sync. {exc}", action["id"]))
         log("d2l.sync: needs login")
         return
-    d2l.DATA.mkdir(parents=True, exist_ok=True)
-    (d2l.DATA / f"snapshot-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json").write_text(json.dumps(snapshot))
+    except d2l.D2LError as exc:
+        with_state(lambda doc: d2l.status_patch(doc, "error", f"D2L sync failed: {exc}", action["id"]))
+        log(f"d2l.sync: error {exc}")
+        return
+    d2l.save_snapshot(snapshot)
     result = with_state(lambda doc: d2l.apply_snapshot(doc, snapshot, action["id"]))
     log(f"d2l.sync: {result['status']} ({result.get('courses')} courses)")
 
 
 def d2l_login(action):
-    with_state(lambda doc: d2l.status_patch(doc, "signing_in", "A D2L sign-in window is open on this Mac.", action["id"]))
-    outcome = d2l.login(600)
+    with_state(lambda doc: d2l.status_patch(doc, "signing_in", "A D2L sign-in window is open on the computer running OwlPilot.",
+                                            action["id"], action="d2l.login"))
+    outcome = d2l.login()
     if outcome.get("status") == "connected":
         sync_d2l({"id": action["id"] + "-sync"})
     else:
-        with_state(lambda doc: d2l.status_patch(doc, "needs_login", outcome.get("reason", "Sign-in not completed.")))
+        status = "needs_setup" if outcome.get("status") == "needs_setup" else "needs_login"
+        with_state(lambda doc: d2l.status_patch(doc, status, outcome.get("reason", "Sign-in not completed.")))
+
+
+def d2l_setup(action, data):
+    """Choose the Brightspace school (preset key or https URL). Validated by d2l.setup_school."""
+    info = d2l.setup_school(school=data.get("school") or None, host=data.get("host") or None)
+    fields = {"site": info["site"], "school": info["school"], "presets": info["presets"]}
+    status = "needs_login" if info["token"] != "valid" else "configured"
+    with_state(lambda doc: d2l.status_patch(doc, status, f"School set to {info['school'] or info['site']}. Sign in to D2L next."
+                                            if status == "needs_login" else "School saved.", action["id"], action="d2l.setup", extra=fields))
+    log(f"d2l.setup: {info['site']}")
+    if status == "configured":
+        sync_d2l({"id": action["id"] + "-sync"})
+
+
+def publish_school():
+    info = d2l.school_info()
+    if not info.get("configured"):
+        # Upgrade from the pre-d2l-cli connector: reuse the school this workspace already synced from.
+        state, _ = unpack_state(read_state())
+        previous = (state["runtime"].get("d2l") or {}).get("site", "")
+        if previous.startswith("https://"):
+            try:
+                info = d2l.setup_school(host=previous)
+                log(f"d2l: carried over school {previous} to d2l-cli")
+            except (OwlPilotError, OSError) as exc:
+                log(f"d2l: could not carry over school: {exc}")
+                info = d2l.school_info()
+    with_state(lambda doc: (lambda r: r if r["patch"] else None)(d2l.school_patch(doc, info)))
+
+
+def _remote_view(info):
+    """What the page may show: addresses and modes only, never pairing secrets."""
+    ts = info.get("tailscale") or {}
+    return {"mode": info.get("mode", "off"), "https": info.get("https", False), "urls": info.get("urls", [])[:4],
+            "funnel": info.get("funnel", "unknown"), "tailscale": {"installed": ts.get("installed", False),
+            "running": ts.get("running", False), "host": ts.get("host", "")}, "checkedAt": stamp(),
+            **({"httpsError": info["httpsError"]} if info.get("httpsError") else {})}
+
+
+def publish_remote(info=None, action_id=None, kind=None, error=None):
+    try:
+        info = info or remote.status()
+    except Exception as exc:  # status is informational; never stop the worker
+        log(f"remote status failed: {exc}")
+        return
+    view = _remote_view(info)
+
+    def fn(doc):
+        state, _ = unpack_state(doc)
+        old = state["runtime"].get("remote") or {}
+        patch = {}
+        if {k: v for k, v in old.items() if k != "checkedAt"} != {k: v for k, v in view.items() if k != "checkedAt"}:
+            patch["runtime"] = {"remote": {**view, "httpsError": view.get("httpsError")}}
+        if action_id:
+            req = {"id": action_id, "action": kind, "courseId": None, "createdAt": stamp(),
+                   "status": "failed" if error else "succeeded"}
+            req.update({"error": str(error)[:300]} if error else {"result": {"mode": view["mode"]}})
+            patch["requests"] = {action_id: req}
+            patch["domainRevision"] = state["domainRevision"] + 1
+        return {"patch": patch} if patch else None
+    with_state(fn)
+
+
+def set_remote(action, enable):
+    kind = "remote.enable" if enable else "remote.disable"
+    try:
+        info = remote.enable() if enable else remote.disable()
+    except OwlPilotError as exc:
+        publish_remote(action_id=action["id"], kind=kind, error=exc)
+        log(f"{kind}: {exc}")
+        return
+    publish_remote(info, action["id"], kind)
+    log(f"{kind}: {info['mode']}")
 
 
 GUIDE_SCHEMA = {
@@ -287,6 +374,11 @@ def main(argv=None):
     args = parser.parse_args(argv)
     resume_running_guides()
     heartbeat("running")
+    for publish in (publish_school, publish_remote):
+        try:
+            publish()
+        except Exception as exc:
+            log(f"startup status failed: {exc}")
     last_beat = time.time()
     while True:
         try:
@@ -302,6 +394,7 @@ def main(argv=None):
         if time.time() - last_beat > 30:
             heartbeat("running")
             last_beat = time.time()
+            publish_remote()  # Tailscale can come and go; keep the page's address list current
         time.sleep(args.interval)
 
 

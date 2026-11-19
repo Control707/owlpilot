@@ -41,7 +41,19 @@ say "Creating Python environment (.venv)"
 .venv/bin/python -m pip install -q -r requirements.txt
 
 say "Installing a browser for D2L sign-in"
-.venv/bin/python -m playwright install chromium
+# d2l-cli falls back to an installed Chrome or Edge, so this download is optional.
+.venv/bin/python -m playwright install chromium || echo "Skipped; D2L sign-in will use your installed Chrome or Edge."
+
+say "Choosing your school (any D2L Brightspace school)"
+if .venv/bin/d2l --json setup --show | grep -q '"lms_host": "http'; then
+  echo "Already configured: $(.venv/bin/d2l --json setup --show | sed -n 's/.*"lms_host": "\(.*\)".*/\1/p')"
+elif [ -n "${OWLPILOT_SCHOOL:-}" ]; then
+  .venv/bin/python -m owlpilot.d2l setup --school "$OWLPILOT_SCHOOL"
+elif [ -n "${D2L_HOST:-${OWLPILOT_D2L_URL:-}}" ]; then
+  .venv/bin/python -m owlpilot.d2l setup --host "${D2L_HOST:-$OWLPILOT_D2L_URL}"
+else
+  echo "Skipped. Pick your school in OwlPilot → Settings, or run:  .venv/bin/d2l setup"
+fi
 
 cat <<EOF
 
@@ -50,6 +62,9 @@ Setup complete. Next:
   1. Start OwlPilot (keep this running):   ./scripts/start.sh
   2. Pair your browser (once per browser):  IT_HOME="\$PWD/.tools/it" .tools/it/bin/it site
   3. Open OwlPilot:                         http://localhost:4700/p/owlpilot
-  4. Settings -> "Sign in to D2L"
+  4. Settings -> choose your school -> "Sign in to D2L"
+
+Optional, to use OwlPilot on your phone or another computer: install Tailscale, sign in, then
+Settings -> "Use on any screen" (or: .venv/bin/python -m owlpilot.remote on).
 
 EOF

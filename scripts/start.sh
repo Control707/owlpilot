@@ -54,6 +54,7 @@ cat <<EOF
 
 OwlPilot is running:  http://localhost:4700/p/owlpilot
 First time in a browser? Pair it:  IT_HOME="\$PWD/.tools/it" .tools/it/bin/it site
+On your phone / another screen (Tailscale):  .venv/bin/python -m owlpilot.remote on   then   ... remote pair
 Press Ctrl-C to stop.
 
 EOF

@@ -168,3 +168,7 @@
 .bar-row{display:flex;align-items:center;gap:12px;padding:8px 0;font-size:12px}.bar-row>span{width:42%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .activity-row{align-items:center}.legend .dot{margin-right:5px}form.annotate{padding-top:10px}
 td{vertical-align:top}.stat strong{display:block}
+
+code.url{display:inline-block;max-width:100%;overflow-wrap:anywhere;background:#edf2e5;padding:4px 8px;border-radius:4px;font-size:12px;user-select:all}
+.brand-sub{text-transform:uppercase}
+@media(max-width:760px){body{padding-bottom:env(safe-area-inset-bottom)}.btn,.nav,select,input{min-height:44px}.topbar .btn#ask{display:none}.footer{flex-direction:column;gap:6px}}
