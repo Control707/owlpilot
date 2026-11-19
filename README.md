@@ -5,7 +5,8 @@
 - a calendar of every due date,
 - a mistake log built from graded work below 80%,
 - per-course grade overviews,
-- review guides that cite your actual course data.
+- your syllabus and recent lecture/assignment files, as searchable course evidence,
+- review guides that cite your actual course data, including the lecture notes themselves.
 
 It runs entirely on your own computer, and with [Tailscale](#use-on-any-screen-tailscale) you can open it on your phone, tablet or any other screen you own. The page is hosted by **[It](https://github.com/Aaryan-Kapoor/it)**, which also stores everything in a local database. A small Python worker handles every button click in the background.
 
@@ -169,7 +170,7 @@ Then open http://localhost:4700/p/owlpilot. Your browser stays paired between re
 | Screen | What you see / can do |
 |---|---|
 | **Overview** | Your next deadline, the count due in the next 7 days, course tiles with grade averages, recent announcements and assistant activity |
-| **Courses** | Every D2L course, with tabs for **Coming up** (due dates), **Announcements**, **Grades** (released scores and feedback), **Topics** (module outline) and **Materials** (add your own notes or PDFs) |
+| **Courses** | Every D2L course, with tabs for **Coming up** (due dates), **Announcements**, **Grades** (released scores and feedback), **Topics** (module outline) and **Materials** (syllabus, downloaded lecture and assignment files, and your own notes or PDFs) |
 | **Calendar** | A week view of every assignment and quiz deadline, with previous and next week |
 | **Assistant activity** | A history of every sync, guide and edit, including failures and the reason |
 | **Approvals** | Items OwlPilot extracted from files *you* uploaded, waiting for you to confirm or reject. D2L data is used directly. |
@@ -179,11 +180,21 @@ Then open http://localhost:4700/p/owlpilot. Your browser stays paired between re
 | **Rules & boundaries** | What OwlPilot does and never does |
 | **Settings** | D2L connection and **Sync now**, the auto-sync interval, and who writes review guides |
 
+## Course files and syllabus
+
+At each sync OwlPilot downloads, read-only, a few files per course through d2l-cli:
+
+- the **4 most recently updated** lecture/content files and up to **3 attachments** of current assignments,
+- only **PDF, PowerPoint (.pptx), Word (.docx), text and Markdown**, each under 15 MB; hidden items, videos and links are skipped,
+- the course **syllabus**: a file titled "Syllabus" in the course content, or otherwise the school's public SimpleSyllabus page when the school preset has one (Kennesaw State does). Grading-weight and policy lines are kept first.
+
+Files are cached in `data/d2l/files/` (owner-only, git-ignored) and downloaded again only when they change. OwlPilot keeps the text, up to ~6,000 characters per file and 18,000 per course, as cited evidence that review guides can quote. The full files stay in D2L. A scanned PDF has no text and is skipped.
+
 ## Review guides
 
 Click **Generate review guide** on the Review guides screen. The worker:
 
-1. Collects that course's synced D2L data and your mistake-log entries, including your notes.
+1. Collects that course's synced D2L data, syllabus and downloaded file text, and your mistake-log entries, including your notes.
 2. Asks **Claude Code** (`claude -p`, with all tools disabled) to write a guide that cites only that evidence.
 3. Checks every citation against the real course data, then saves the guide. This usually takes under a minute.
 
@@ -276,7 +287,7 @@ The D2L sign-in window always opens on the computer running OwlPilot, not on the
 ## Privacy and safety
 
 - **Everything stays on your computer.** It answers only on `localhost` unless you turn on remote access, and then only your Tailscale devices, each of which must be paired. Course data lives in It's database inside `.tools/it/` and in `data/`, and both are git-ignored.
-- **D2L is read-only.** OwlPilot only makes GET requests: courses, assignments, quizzes, announcements, released grades and content outline. It never submits, posts, opens quizzes, or changes anything.
+- **D2L is read-only.** OwlPilot only makes GET requests: courses, assignments, quizzes, announcements, released grades, content outline, and a few course files and the syllabus. It never submits, posts, opens quizzes, or changes anything.
 - **Your password is never seen.** You sign in to D2L yourself in a normal browser window. d2l-cli saves the short-lived API token and the browser profile in `~/.d2l/`. **Never commit or share `~/.d2l/` or the `data/` folder.**
 - **AI use.** When you generate a review guide, relevant excerpts of that course's data are sent to the AI provider behind Claude Code (or your chosen agent). Nothing is sent otherwise.
 - **No graded work.** Guides are study aids with ungraded practice. OwlPilot will not write or submit assignments.
