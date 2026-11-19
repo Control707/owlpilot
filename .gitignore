@@ -5,3 +5,7 @@ data/
 __pycache__/
 *.pyc
 .DS_Store
+
+# Local-only notes and test pages
+.scratch/owlpilot/build-progress.md
+bridge-test.html
