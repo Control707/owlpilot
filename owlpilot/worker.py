@@ -22,11 +22,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import d2l, remote
-from .core import ROOT, OwlPilotError, complete_guide, guide_context, handle_action, stamp, unpack_state
+from .core import IT_BINARY, IT_HOME, ROOT, OwlPilotError, complete_guide, guide_context, handle_action, utc_now, unpack_state
 
 PAGE = "owlpilot"
-IT = ROOT / ".tools" / "it" / "bin" / "it"
-IT_HOME = str(ROOT / ".tools" / "it")
 INCOMING = ROOT / "data" / "incoming"
 LOG = ROOT / "data" / "worker.log"
 CLAUDE = os.environ.get("OWLPILOT_CLAUDE", "claude")
@@ -42,8 +40,8 @@ def log(message):
 
 
 def it(*args, input_text=None, check=True):
-    env = {**os.environ, "IT_HOME": IT_HOME}
-    proc = subprocess.run([str(IT), *args], capture_output=True, text=True, env=env, timeout=120, input=input_text)
+    env = {**os.environ, "IT_HOME": str(IT_HOME)}
+    proc = subprocess.run([str(IT_BINARY), *args], capture_output=True, text=True, env=env, timeout=120, input=input_text)
     if check and proc.returncode != 0:
         raise RuntimeError(f"it {args[0]} failed: {proc.stderr.strip()[:300]}")
     return proc
@@ -95,7 +93,7 @@ def record_failure(action, message):
         if action["id"] in state["requests"]:
             return {"patch": {}}
         req = {"id": action["id"], "action": action.get("action"), "courseId": (action.get("data") or {}).get("courseId"),
-               "status": "failed", "error": str(message)[:300], "createdAt": stamp()}
+               "status": "failed", "error": str(message)[:300], "createdAt": utc_now()}
         return {"patch": {"requests": {action["id"]: req}, "domainRevision": state["domainRevision"] + 1}}
     with_state(fn)
 
@@ -144,17 +142,15 @@ def sync_d2l(action):
     """Read D2L through d2l-cli. Expired tokens are refreshed silently; only a dead session asks for sign-in."""
     try:
         snapshot = d2l.collect()
-    except d2l.NeedsSetup as exc:
-        with_state(lambda doc: d2l.status_patch(doc, "needs_setup", str(exc), action["id"]))
-        log("d2l.sync: needs school setup")
-        return
-    except d2l.NeedsLogin as exc:
-        with_state(lambda doc: d2l.status_patch(doc, "needs_login", f"Sign in to D2L to sync. {exc}", action["id"]))
-        log("d2l.sync: needs login")
-        return
     except d2l.D2LError as exc:
-        with_state(lambda doc: d2l.status_patch(doc, "error", f"D2L sync failed: {exc}", action["id"]))
-        log(f"d2l.sync: error {exc}")
+        if isinstance(exc, d2l.NeedsSetup):
+            status, message = "needs_setup", str(exc)
+        elif isinstance(exc, d2l.NeedsLogin):
+            status, message = "needs_login", f"Sign in to D2L to sync. {exc}"
+        else:
+            status, message = "error", f"D2L sync failed: {exc}"
+        with_state(lambda doc: d2l.status_patch(doc, status, message, action["id"]))
+        log(f"d2l.sync: {status} {exc}")
         return
     d2l.save_snapshot(snapshot)
     result = with_state(lambda doc: d2l.apply_snapshot(doc, snapshot, action["id"]))
@@ -205,7 +201,7 @@ def _remote_view(info):
     ts = info.get("tailscale") or {}
     return {"mode": info.get("mode", "off"), "https": info.get("https", False), "urls": info.get("urls", [])[:4],
             "funnel": info.get("funnel", "unknown"), "tailscale": {"installed": ts.get("installed", False),
-            "running": ts.get("running", False), "host": ts.get("host", "")}, "checkedAt": stamp(),
+            "running": ts.get("running", False), "host": ts.get("host", "")}, "checkedAt": utc_now(),
             **({"httpsError": info["httpsError"]} if info.get("httpsError") else {})}
 
 
@@ -224,7 +220,7 @@ def publish_remote(info=None, action_id=None, kind=None, error=None):
         if {k: v for k, v in old.items() if k != "checkedAt"} != {k: v for k, v in view.items() if k != "checkedAt"}:
             patch["runtime"] = {"remote": {**view, "httpsError": view.get("httpsError")}}
         if action_id:
-            req = {"id": action_id, "action": kind, "courseId": None, "createdAt": stamp(),
+            req = {"id": action_id, "action": kind, "courseId": None, "createdAt": utc_now(),
                    "status": "failed" if error else "succeeded"}
             req.update({"error": str(error)[:300]} if error else {"result": {"mode": view["mode"]}})
             patch["requests"] = {action_id: req}
@@ -245,20 +241,21 @@ def set_remote(action, enable):
     log(f"{kind}: {info['mode']}")
 
 
+def _object_list(*fields):
+    """JSON Schema for a list of strict objects with string fields plus cited sourceIds."""
+    properties = {name: {"type": "string"} for name in fields}
+    properties["sourceIds"] = {"type": "array", "items": {"type": "string"}}
+    return {"type": "array", "items": {"type": "object", "additionalProperties": False,
+                                       "required": [*fields, "sourceIds"], "properties": properties}}
+
+
+STRING_LIST = {"type": "array", "items": {"type": "string"}}
 GUIDE_SCHEMA = {
     "type": "object", "additionalProperties": False,
     "required": ["overview", "topics", "mistakes", "practice", "checklist", "gaps"],
-    "properties": {
-        "overview": {"type": "string"},
-        "topics": {"type": "array", "items": {"type": "object", "additionalProperties": False, "required": ["title", "summary", "sourceIds"],
-                   "properties": {"title": {"type": "string"}, "summary": {"type": "string"}, "sourceIds": {"type": "array", "items": {"type": "string"}}}}},
-        "mistakes": {"type": "array", "items": {"type": "object", "additionalProperties": False, "required": ["mistakeId", "advice", "sourceIds"],
-                     "properties": {"mistakeId": {"type": "string"}, "advice": {"type": "string"}, "sourceIds": {"type": "array", "items": {"type": "string"}}}}},
-        "practice": {"type": "array", "items": {"type": "object", "additionalProperties": False, "required": ["question", "answer", "sourceIds"],
-                     "properties": {"question": {"type": "string"}, "answer": {"type": "string"}, "sourceIds": {"type": "array", "items": {"type": "string"}}}}},
-        "checklist": {"type": "array", "items": {"type": "string"}},
-        "gaps": {"type": "array", "items": {"type": "string"}},
-    },
+    "properties": {"overview": {"type": "string"}, "topics": _object_list("title", "summary"),
+                   "mistakes": _object_list("mistakeId", "advice"), "practice": _object_list("question", "answer"),
+                   "checklist": STRING_LIST, "gaps": STRING_LIST},
 }
 
 
@@ -305,7 +302,7 @@ def fail_guide(request_id, reason):
         req = state["requests"].get(request_id)
         if not req or req.get("status") != "running":
             return None
-        return {"patch": {"requests": {request_id: {"status": "failed", "error": reason[:300], "completedAt": stamp()}},
+        return {"patch": {"requests": {request_id: {"status": "failed", "error": reason[:300], "completedAt": utc_now()}},
                           "domainRevision": state["domainRevision"] + 1}}
     with_state(fn)
     log(f"guide {request_id}: failed — {reason}")
@@ -325,7 +322,7 @@ def due_for_auto_sync():
 def heartbeat(worker_status):
     def fn(doc):
         state, _ = unpack_state(doc)
-        return {"patch": {"runtime": {"worker": {"status": worker_status, "seenAt": stamp(), "pid": os.getpid()},
+        return {"patch": {"runtime": {"worker": {"status": worker_status, "seenAt": utc_now(), "pid": os.getpid()},
                                       "activeAgent": "OwlPilot worker + Claude Code"}}}
     try:
         with_state(fn)

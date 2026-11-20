@@ -10,29 +10,36 @@ from datetime import datetime, timezone, date
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-STATE_LIMIT = 400 * 1024  # It allows 512 KiB per page; leave room for _page drafts
+IT_STATE_LIMIT = 512 * 1024  # It allows 512 KiB per page, including _page drafts
+STATE_LIMIT = 400 * 1024  # academic share; leaves room for _page drafts
 PASTE_LIMIT = 24 * 1024
 ACTION_LIMIT = 32 * 1024
 TEXT_LIMIT = 100_000
 PDF_LIMIT = 10 * 1024 * 1024
 PDF_PAGES = 50
 ROOT = Path(__file__).resolve().parents[1]
-KEYS = ("schemaVersion", "domainRevision", "courses", "courseOrder", "materials", "facts", "mistakes", "mistakeOrder", "guides", "requests", "runtime", "priorities", "coursework", "settings")
+IT_HOME = ROOT / ".tools" / "it"  # project-local It install
+IT_BINARY = IT_HOME / "bin" / "it"
+STATE_KEYS = ("schemaVersion", "domainRevision", "courses", "courseOrder", "materials", "facts", "mistakes", "mistakeOrder", "guides", "requests", "runtime", "priorities", "coursework", "settings")
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,160}$")
+DEFAULT_SETTINGS = {"autoSyncHours": 6, "guideGenerator": "claude-code"}
+SUPPORTED_ACTIONS = frozenset({"course.create", "course.import_text", "course.import_file", "course.propose_facts",
+                               "course.confirm_facts", "mistake.add", "mistake.annotate", "mistake.delete", "course.remove",
+                               "guide.generate", "guide.complete", "priorities.refresh", "settings.update"})
 
 
 class OwlPilotError(ValueError):
     """A safe, user-facing contract failure. No state was applied to It."""
 
 
-def encoded(value):
+def canonical_json(value):
     try:
         return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
     except (ValueError, TypeError, UnicodeError) as exc:
         raise OwlPilotError("Input must be finite, UTF-8-compatible JSON.") from exc
 
 
-def text(value, name, limit=2000, optional=False):
+def require_text(value, name, limit=2000, optional=False):
     if optional and value is None:
         return ""
     if not isinstance(value, str) or (not optional and not value.strip()) or len(value.encode("utf-8")) > limit:
@@ -42,32 +49,32 @@ def text(value, name, limit=2000, optional=False):
     return value.strip()
 
 
-def integer(value, name):
+def require_nonnegative_int(value, name):
     if type(value) is not int or value < 0:
         raise OwlPilotError(f"{name} must be a nonnegative integer.")
     return value
 
 
-def identifier(value, name="ID"):
+def require_id(value, name="ID"):
     if not isinstance(value, str) or not ID_RE.fullmatch(value):
         raise OwlPilotError(f"{name} must be a safe nonempty identifier.")
     return value
 
 
 def new_id(kind, *parts):
-    return kind + "_" + hashlib.sha256(encoded(parts)).hexdigest()[:20]
+    return kind + "_" + hashlib.sha256(canonical_json(parts)).hexdigest()[:20]
 
 
-def stamp():
+def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
 def initial_state(agent="DeepSeek Harness"):
     return {"schemaVersion": 1, "domainRevision": 0, "courses": {}, "courseOrder": [],
             "materials": {}, "facts": {}, "mistakes": {}, "mistakeOrder": [], "guides": {},
-            "requests": {}, "runtime": {"activeAgent": text(agent, "agent", 100), "generation": 1,
+            "requests": {}, "runtime": {"activeAgent": require_text(agent, "agent", 100), "generation": 1,
             "supervised": True, "ready": False}, "priorities": [], "coursework": {},
-            "settings": {"autoSyncHours": 6, "guideGenerator": "claude-code"}}
+            "settings": dict(DEFAULT_SETTINGS)}
 
 
 def unpack_state(document):
@@ -82,12 +89,12 @@ def unpack_state(document):
         revision = document.get("revision", document.get("stateRevision"))
         document = document["state"]
     if revision is not None:
-        integer(revision, "It state revision")
+        require_nonnegative_int(revision, "It state revision")
     if not document or set(document).issubset({"_page"}):
         return initial_state(), revision
     document = copy.deepcopy(document)
     document.setdefault("coursework", {})
-    document.setdefault("settings", {"autoSyncHours": 6, "guideGenerator": "claude-code"})
+    document.setdefault("settings", dict(DEFAULT_SETTINGS))
     validate_state(document)
     return document, revision
 
@@ -95,25 +102,37 @@ def unpack_state(document):
 def validate_state(state):
     if not isinstance(state, dict) or type(state.get("schemaVersion")) is not int or state.get("schemaVersion") != 1:
         raise OwlPilotError("Unsupported or missing OwlPilot schemaVersion.")
-    integer(state.get("domainRevision"), "domainRevision")
+    require_nonnegative_int(state.get("domainRevision"), "domainRevision")
     for key in ("courses", "materials", "facts", "mistakes", "guides", "requests", "runtime"):
         if not isinstance(state.get(key), dict):
             raise OwlPilotError(f"State {key} must be an object.")
     for key in ("courseOrder", "mistakeOrder", "priorities"):
         if not isinstance(state.get(key), list):
             raise OwlPilotError(f"State {key} must be a list.")
-    integer(state["runtime"].get("generation"), "consumer generation")
+    require_nonnegative_int(state["runtime"].get("generation"), "consumer generation")
     for group in ("courses", "materials", "facts", "mistakes", "requests"):
         for key, value in state[group].items():
-            identifier(key)
+            require_id(key)
             if not isinstance(value, dict):
                 raise OwlPilotError(f"State {group} record must be an object.")
     check_budget(state)
 
 
+def write_new_json(path, value, reject_symlinked_parent=True):
+    """Write JSON to a new, caller-chosen file; never overwrite an existing file or symlink."""
+    target = Path(path)
+    if target.is_symlink() or target.exists():
+        raise OwlPilotError("Output already exists; choose a new filename.")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if reject_symlinked_parent and target.parent.is_symlink():
+        raise OwlPilotError("Output parent must not be a symlink.")
+    with target.open("xb") as f:
+        f.write(canonical_json(value) + b"\n")
+
+
 def check_budget(state):
-    size = len(encoded({k: state[k] for k in KEYS if k in state}))
-    if len(encoded(state)) > 512 * 1024:
+    size = len(canonical_json({k: state[k] for k in STATE_KEYS if k in state}))
+    if len(canonical_json(state)) > IT_STATE_LIMIT:
         raise OwlPilotError("Combined It state exceeds 512 KiB including UI drafts/unrelated keys.")
     if size > STATE_LIMIT:
         raise OwlPilotError(f"Academic state exceeds 400 KiB ({size} bytes). Export/archive explicitly or supply a narrower source; nothing was silently discarded.")
@@ -135,18 +154,18 @@ def merge_patch(before, after):
                 else:
                     result[key] = copy.deepcopy(value)
         return result
-    return diff({k: before[k] for k in KEYS if k in before}, {k: after[k] for k in KEYS if k in after})
+    return diff({k: before[k] for k in STATE_KEYS if k in before}, {k: after[k] for k in STATE_KEYS if k in after})
 
 
-def course(state, cid):
-    identifier(cid, "courseId")
+def get_course(state, cid):
+    require_id(cid, "courseId")
     c = state["courses"].get(cid)
     if not isinstance(c, dict):
         raise OwlPilotError("Unknown courseId.")
     return c
 
 
-def sources(state, cid):
+def course_source_chunks(state, cid):
     result = {}
     for material in state["materials"].values():
         if material.get("courseId") == cid:
@@ -160,13 +179,13 @@ def source_ids(value, state, cid, required=True):
         raise OwlPilotError("sourceIds must be a list of at most 50 source IDs.")
     if required and not value:
         raise OwlPilotError("A course-specific claim requires sourceIds.")
-    known = sources(state, cid)
-    if any(x not in known for x in value):
+    known = course_source_chunks(state, cid)
+    if any(ref not in known for ref in value):
         raise OwlPilotError("Unknown or cross-course source citation.")
     return list(dict.fromkeys(value))
 
 
-def allowed_sources(state, cid):
+def confirmed_source_ids(state, cid):
     return {sid for f in state["facts"].values() if f.get("courseId") == cid and f.get("status") == "confirmed" for sid in f.get("sourceIds", [])}
 
 
@@ -215,7 +234,7 @@ def chunk_text(content, mid, page=None, start_line=1):
 
 def prepare_material(cid, name, aid, content=None, file_path=None):
     """Extraction is read-only; source files are written only after full action validation."""
-    display_name = text(name, "material name", 180)
+    display_name = require_text(name, "material name", 180)
     if file_path is not None:
         path = Path(file_path)
         if path.is_symlink() or not path.is_file():
@@ -275,7 +294,7 @@ def prepare_material(cid, name, aid, content=None, file_path=None):
 
 def save_material(root, material, raw, extracted):
     base = safe_source_root(root)
-    mid = identifier(material["id"])
+    mid = require_id(material["id"])
     target = base / mid
     if target.is_symlink():
         raise OwlPilotError("Refusing symlink material destination.")
@@ -296,11 +315,11 @@ def save_material(root, material, raw, extracted):
 def validate_deadline(value):
     if not isinstance(value, dict):
         raise OwlPilotError("Deadline value must be {title,date?,time?,timezone?}; ambiguous fields stay empty.")
-    result = {"title": text(value.get("title"), "deadline title", 300)}
+    result = {"title": require_text(value.get("title"), "deadline title", 300)}
     for key in ("date", "time", "timezone"):
         val = value.get(key, "")
         if val:
-            val = text(val, key, 100)
+            val = require_text(val, key, 100)
             try:
                 if key == "date":
                     date.fromisoformat(val)
@@ -339,36 +358,57 @@ def action_envelope(action):
     # Some integrations wrap an actual action object once; plain It {id,action,data} is primary.
     if isinstance(action.get("action"), dict):
         action = action["action"]
-    aid = identifier(action.get("id", action.get("actionId")), "action ID")
-    kind = text(action.get("action", action.get("name")), "action name", 80)
+    aid = require_id(action.get("id", action.get("actionId")), "action ID")
+    kind = require_text(action.get("action", action.get("name")), "action name", 80)
     data = action.get("data", {})
     if not isinstance(data, dict):
         raise OwlPilotError("Action data must be an object.")
-    if len(encoded(data)) > ACTION_LIMIT:
+    if len(canonical_json(data)) > ACTION_LIMIT:
         raise OwlPilotError("Action JSON exceeds 32 KiB.")
     return aid, kind, data
+
+
+def fact_value(kind, value):
+    return require_text(value, "topic", 500) if kind == "topic" else validate_deadline(value)
+
+
+def add_candidate_facts(state, cid, aid, material, proposals, default_refs=()):
+    """Record supplied topic/deadline proposals as unconfirmed facts citing the given material."""
+    material_chunks = {chunk["id"] for chunk in material["chunks"]}
+    fids = []
+    for index, proposal in enumerate(proposals):
+        if not isinstance(proposal, dict) or proposal.get("kind") not in ("topic", "deadline"):
+            raise OwlPilotError("Candidate kind must be topic or deadline.")
+        refs = source_ids(proposal.get("sourceIds", list(default_refs)), state, cid)
+        if any(ref not in material_chunks for ref in refs):
+            raise OwlPilotError("Proposals must cite the selected material.")
+        fid = new_id("fact", aid, index)
+        state["facts"][fid] = {"id": fid, "courseId": cid, "materialId": material["id"], "materialRevision": material["revision"],
+                               "kind": proposal["kind"], "value": fact_value(proposal["kind"], proposal.get("value")),
+                               "sourceIds": refs, "status": "candidate", "revision": 1, "proposedBy": "supplied_proposal"}
+        fids.append(fid)
+    return fids
 
 
 def handle_action(document, action, *, root=ROOT, file_path=None, proposals=None):
     state, it_revision = unpack_state(document)
     before = copy.deepcopy(state)
     aid, kind, data = action_envelope(action)
-    payload_hash = hashlib.sha256(encoded({"action": kind, "data": data})).hexdigest()
+    payload_hash = hashlib.sha256(canonical_json({"action": kind, "data": data})).hexdigest()
     existing = state["requests"].get(aid)
     if existing:
         if existing.get("payloadHash") != payload_hash:
             raise OwlPilotError("An existing action ID has a different payload; refusing replay.")
         return {"status": "duplicate", "requestStatus": existing["status"], "patch": {}, "state": state,
                 "ifRevision": it_revision, "requestId": aid, "domainRevision": state["domainRevision"]}
-    if integer(data.get("domainRevision"), "domainRevision") != state["domainRevision"]:
+    if require_nonnegative_int(data.get("domainRevision"), "domainRevision") != state["domainRevision"]:
         raise OwlPilotError("Stale domainRevision; refresh state and explicitly review/retry.")
     prune_requests(state)
-    supported = {"course.create", "course.import_text", "course.import_file", "course.propose_facts", "course.confirm_facts", "mistake.add", "mistake.annotate", "mistake.delete", "course.remove", "guide.generate", "guide.complete", "priorities.refresh", "settings.update"}
-    if kind not in supported:
+    if kind not in SUPPORTED_ACTIONS:
         raise OwlPilotError("Unsupported academic action; no external-write or graded-submission handler exists.")
     cid = data.get("courseId")
     if kind not in ("course.create", "settings.update"):
-        course(state, cid)
+        get_course(state, cid)
     result = {}
     storage = None
     request_status = "succeeded"
@@ -376,13 +416,13 @@ def handle_action(document, action, *, root=ROOT, file_path=None, proposals=None
         cid = new_id("course", aid)
         if type(data.get("isSample")) is not bool:
             raise OwlPilotError("isSample must be explicitly true or false.")
-        tz = text(data.get("timezone", ""), "timezone", 100, optional=True)
+        tz = require_text(data.get("timezone", ""), "timezone", 100, optional=True)
         if tz:
             try:
                 ZoneInfo(tz)
             except ZoneInfoNotFoundError as exc:
                 raise OwlPilotError("Unknown course timezone.") from exc
-        state["courses"][cid] = {"id": cid, "name": text(data.get("name"), "course name", 200), "isSample": data["isSample"], "timezone": tz, "revision": 1}
+        state["courses"][cid] = {"id": cid, "name": require_text(data.get("name"), "course name", 200), "isSample": data["isSample"], "timezone": tz, "revision": 1}
         state["courseOrder"].append(cid)
         result = {"courseId": cid}
     elif kind.startswith("course.import_"):
@@ -392,7 +432,7 @@ def handle_action(document, action, *, root=ROOT, file_path=None, proposals=None
                                                     content=data.get("text"), file_path=file_path if kind == "course.import_file" else None)
         replaces = data.get("replacesMaterialId")
         if replaces is not None:
-            identifier(replaces, "replacesMaterialId")
+            require_id(replaces, "replacesMaterialId")
             old = state["materials"].get(replaces)
             if not old or old["courseId"] != cid:
                 raise OwlPilotError("Replacement source must be an existing same-course material.")
@@ -407,42 +447,20 @@ def handle_action(document, action, *, root=ROOT, file_path=None, proposals=None
         values = proposals if proposals is not None else data.get("proposals", [])
         if not isinstance(values, list) or len(values) > 50:
             raise OwlPilotError("Provide at most 50 explicit source-based candidate proposals.")
-        fids = []
-        for i, proposal in enumerate(values):
-            if not isinstance(proposal, dict) or proposal.get("kind") not in ("topic", "deadline"):
-                raise OwlPilotError("Candidate kind must be topic or deadline.")
-            refs = source_ids(proposal.get("sourceIds", [material["chunks"][0]["id"]] if len(material["chunks"]) == 1 else []), state, cid)
-            if any(x not in {c["id"] for c in material["chunks"]} for x in refs):
-                raise OwlPilotError("New import candidates must cite the imported material.")
-            value = text(proposal.get("value"), "topic", 500) if proposal["kind"] == "topic" else validate_deadline(proposal.get("value"))
-            fid = new_id("fact", aid, i)
-            state["facts"][fid] = {"id": fid, "courseId": cid, "materialId": material["id"], "materialRevision": material["revision"],
-                "kind": proposal["kind"], "value": value, "sourceIds": refs, "status": "candidate", "revision": 1, "proposedBy": "supplied_proposal"}
-            fids.append(fid)
+        default_refs = [material["chunks"][0]["id"]] if len(material["chunks"]) == 1 else []
+        fids = add_candidate_facts(state, cid, aid, material, values, default_refs)
         bump_course(state, cid)
         storage = (material, raw, extracted)
         result = {"materialId": material["id"], "factIds": fids, "needsProposal": not bool(values)}
     elif kind == "course.propose_facts":
-        material_id = identifier(data.get("materialId"), "materialId")
+        material_id = require_id(data.get("materialId"), "materialId")
         material = state["materials"].get(material_id)
         if not material or material["courseId"] != cid or material.get("supersededBy"):
             raise OwlPilotError("Unknown, superseded or cross-course material.")
         values = proposals if proposals is not None else data.get("proposals")
         if not isinstance(values, list) or not values or len(values) > 50:
             raise OwlPilotError("Provide 1–50 explicit source-based proposals.")
-        fids = []
-        for i, proposal in enumerate(values):
-            if not isinstance(proposal, dict) or proposal.get("kind") not in ("topic", "deadline"):
-                raise OwlPilotError("Candidate kind must be topic or deadline.")
-            refs = source_ids(proposal.get("sourceIds", []), state, cid)
-            if any(sid not in {c["id"] for c in material["chunks"]} for sid in refs):
-                raise OwlPilotError("Proposals must cite the selected material.")
-            value = text(proposal.get("value"), "topic", 500) if proposal["kind"] == "topic" else validate_deadline(proposal.get("value"))
-            fid = new_id("fact", aid, i)
-            state["facts"][fid] = {"id": fid, "courseId": cid, "materialId": material_id,
-                "materialRevision": material["revision"], "kind": proposal["kind"], "value": value,
-                "sourceIds": refs, "status": "candidate", "revision": 1, "proposedBy": "supplied_proposal"}
-            fids.append(fid)
+        fids = add_candidate_facts(state, cid, aid, material, values)
         bump_course(state, cid)
         result = {"factIds": fids, "materialId": material_id}
     elif kind == "course.confirm_facts":
@@ -453,7 +471,7 @@ def handle_action(document, action, *, root=ROOT, file_path=None, proposals=None
         for decision in decisions:
             if not isinstance(decision, dict):
                 raise OwlPilotError("Fact decision must be an object.")
-            fid = identifier(decision.get("factId"), "factId")
+            fid = require_id(decision.get("factId"), "factId")
             fact = state["facts"].get(fid)
             if not fact or fact["courseId"] != cid or fid in seen:
                 raise OwlPilotError("Unknown, duplicate or cross-course fact decision.")
@@ -464,7 +482,7 @@ def handle_action(document, action, *, root=ROOT, file_path=None, proposals=None
             if status not in ("confirmed", "rejected"):
                 raise OwlPilotError("Fact status must be confirmed or rejected.")
             if "value" in decision:
-                fact["value"] = text(decision["value"], "topic", 500) if fact["kind"] == "topic" else validate_deadline(decision["value"])
+                fact["value"] = fact_value(fact["kind"], decision["value"])
                 fact["userProvided"] = True
             fact["status"] = status
             fact["revision"] += 1
@@ -475,9 +493,9 @@ def handle_action(document, action, *, root=ROOT, file_path=None, proposals=None
         if origin not in ("graded", "practice"):
             raise OwlPilotError("Mistakes must come from already-graded work or ungraded practice.")
         mid = new_id("mistake", aid)
-        m = {"id": mid, "courseId": cid, "origin": origin, "assessment": text(data.get("assessment"), "assessment", 200),
-             "question": text(data.get("question", ""), "question", 200, optional=True), "description": text(data.get("description"), "description", 3000),
-             "feedback": text(data.get("feedback"), "feedback", 3000), "sourceIds": source_ids(data.get("sourceIds", []), state, cid, required=False), "revision": 1}
+        m = {"id": mid, "courseId": cid, "origin": origin, "assessment": require_text(data.get("assessment"), "assessment", 200),
+             "question": require_text(data.get("question", ""), "question", 200, optional=True), "description": require_text(data.get("description"), "description", 3000),
+             "feedback": require_text(data.get("feedback"), "feedback", 3000), "sourceIds": source_ids(data.get("sourceIds", []), state, cid, required=False), "revision": 1}
         if data.get("pointsLost") is not None:
             number = data["pointsLost"]
             if type(number) not in (int, float) or not math.isfinite(number) or number < 0 or number > 1_000_000:
@@ -488,16 +506,16 @@ def handle_action(document, action, *, root=ROOT, file_path=None, proposals=None
         bump_course(state, cid)
         result = {"mistakeId": mid}
     elif kind == "mistake.annotate":
-        mid = identifier(data.get("mistakeId"), "mistakeId")
+        mid = require_id(data.get("mistakeId"), "mistakeId")
         m = state["mistakes"].get(mid)
         if not m or m["courseId"] != cid:
             raise OwlPilotError("Unknown or cross-course mistake.")
-        m["studentNote"] = text(data.get("note"), "note", 3000)
+        m["studentNote"] = require_text(data.get("note"), "note", 3000)
         m["revision"] += 1
         bump_course(state, cid)
         result = {"mistakeId": mid}
     elif kind == "mistake.delete":
-        mid = identifier(data.get("mistakeId"), "mistakeId")
+        mid = require_id(data.get("mistakeId"), "mistakeId")
         m = state["mistakes"].get(mid)
         if not m or m["courseId"] != cid:
             raise OwlPilotError("Unknown or cross-course mistake.")
@@ -510,7 +528,7 @@ def handle_action(document, action, *, root=ROOT, file_path=None, proposals=None
         bump_course(state, cid)
         result = {"mistakeId": mid}
     elif kind == "course.remove":
-        c = course(state, cid)
+        c = get_course(state, cid)
         if c.get("source") == "d2l":
             raise OwlPilotError("D2L courses follow your D2L enrollment and cannot be removed here.")
         state["courses"].pop(cid)
@@ -533,7 +551,7 @@ def handle_action(document, action, *, root=ROOT, file_path=None, proposals=None
         cid = None
         result = {"settings": state["settings"]}
     elif kind == "guide.complete":
-        target_id = identifier(data.get("requestId"), "requestId")
+        target_id = require_id(data.get("requestId"), "requestId")
         target = state["requests"].get(target_id)
         if not target or target.get("courseId") != cid:
             raise OwlPilotError("Unknown or cross-course guide reservation.")
@@ -544,15 +562,15 @@ def handle_action(document, action, *, root=ROOT, file_path=None, proposals=None
     elif kind == "guide.generate":
         if any(r.get("courseId") == cid and r.get("action") == "guide.generate" and r.get("status") == "running" for r in state["requests"].values()):
             raise OwlPilotError("A guide request is already running. Review/recover it explicitly; automatic retry is disabled.")
-        if not allowed_sources(state, cid):
+        if not confirmed_source_ids(state, cid):
             raise OwlPilotError("Confirm source-linked course facts before requesting a personalized guide.")
         request_status = "running"
-        result = {"courseRevision": course(state, cid)["revision"], "generation": state["runtime"]["generation"],
+        result = {"courseRevision": get_course(state, cid)["revision"], "generation": state["runtime"]["generation"],
                   "sourceRevisions": {m["id"]: m["revision"] for m in state["materials"].values() if m.get("courseId") == cid},
                   "mistakeRevisions": {m["id"]: m["revision"] for m in state["mistakes"].values() if m.get("courseId") == cid}}
     state["domainRevision"] += 1
     req = {"id": aid, "action": kind, "payloadHash": payload_hash, "courseId": cid, "status": request_status,
-           "createdAt": stamp(), "inputRevision": before["domainRevision"], "result": result}
+           "createdAt": utc_now(), "inputRevision": before["domainRevision"], "result": result}
     if kind == "guide.generate":
         req.update(result)
         req["agent"] = state["runtime"].get("activeAgent", "Unknown agent")
@@ -566,7 +584,7 @@ def handle_action(document, action, *, root=ROOT, file_path=None, proposals=None
     # Empty It state needs the full schema even when wrapped in {state:{},revision:N}.
     raw_state = document.get("state", document) if isinstance(document, dict) else {}
     if not raw_state or set(raw_state).issubset({"_page"}):
-        response["patch"] = {k: state[k] for k in KEYS}
+        response["patch"] = {k: state[k] for k in STATE_KEYS}
     if kind == "guide.generate":
         response["context"] = guide_context(state, cid, aid)
     return response
@@ -582,15 +600,15 @@ def prune_requests(state, keep=80):
 
 def guide_context(document, cid, request_id=None):
     state, _ = unpack_state(document)
-    c = course(state, cid)
+    c = get_course(state, cid)
     if request_id:
         pending = state["requests"].get(request_id)
         if pending and (pending.get("courseRevision") != c["revision"] or pending.get("generation") != state["runtime"]["generation"]):
             raise OwlPilotError("Guide reservation is stale; do not run a model on changed context.")
-    refs = allowed_sources(state, cid)
+    refs = confirmed_source_ids(state, cid)
     if not refs:
         raise OwlPilotError("No confirmed source-linked facts available for this course.")
-    known = sources(state, cid)
+    known = course_source_chunks(state, cid)
     selected = {sid: known[sid] for sid in sorted(refs) if sid in known}
     if not selected:
         raise OwlPilotError("Confirmed evidence is missing; reimport/confirm sources.")
@@ -604,22 +622,22 @@ def guide_context(document, cid, request_id=None):
                   "practice": [{"question": "string", "answer": "string", "sourceIds": ["source chunk ID"]}],
                   "checklist": ["string"], "gaps": ["string"]}}
     if request_id:
-        identifier(request_id, "request ID")
+        require_id(request_id, "request ID")
         request = state["requests"].get(request_id)
         if not request or request.get("action") != "guide.generate" or request.get("courseId") != cid or request.get("status") != "running":
             raise OwlPilotError("No matching running guide reservation.")
         result["requestId"] = request_id
-    if len(encoded(result)) > STATE_LIMIT:
+    if len(canonical_json(result)) > STATE_LIMIT:
         raise OwlPilotError("Context is too large; explicitly choose narrower evidence.")
     return result
 
 
 def validate_guide(guide, state, cid):
     expected = {"overview", "topics", "mistakes", "practice", "checklist", "gaps"}
-    if not isinstance(guide, dict) or set(guide) != expected or len(encoded(guide)) > 60_000:
+    if not isinstance(guide, dict) or set(guide) != expected or len(canonical_json(guide)) > 60_000:
         raise OwlPilotError("Guide must use exactly the documented sections and stay under 60,000 bytes.")
-    out = {"overview": text(guide["overview"], "overview", 3000)}
-    allowed = allowed_sources(state, cid)
+    out = {"overview": require_text(guide["overview"], "overview", 3000)}
+    allowed = confirmed_source_ids(state, cid)
     for section in ("topics", "mistakes", "practice"):
         items = guide[section]
         if not isinstance(items, list) or len(items) > 12:
@@ -634,7 +652,7 @@ def validate_guide(guide, state, cid):
                 raise OwlPilotError("Guide citations must come from confirmed evidence.")
             clean = {"sourceIds": refs}
             for key in fields - {"sourceIds"}:
-                clean[key] = text(item[key], key, 4000 if key not in ("title", "mistakeId") else 300)
+                clean[key] = require_text(item[key], key, 4000 if key not in ("title", "mistakeId") else 300)
             if section == "mistakes":
                 m = state["mistakes"].get(clean["mistakeId"])
                 if not m or m.get("courseId") != cid:
@@ -643,7 +661,7 @@ def validate_guide(guide, state, cid):
     for key in ("checklist", "gaps"):
         if not isinstance(guide[key], list) or len(guide[key]) > 20:
             raise OwlPilotError(f"{key} must contain at most 20 strings.")
-        out[key] = [text(x, key, 600) for x in guide[key]]
+        out[key] = [require_text(x, key, 600) for x in guide[key]]
     if not out["topics"] and not out["gaps"]:
         raise OwlPilotError("An empty-evidence guide must explain its gaps.")
     # Overview/checklist are instructional synthesis, not a substitute for cited factual topics.
@@ -654,11 +672,11 @@ def fail_request(document, request_id, message):
     """Explicit supervised recovery: mark interrupted work failed without model retry."""
     state, it_revision = unpack_state(document)
     before = copy.deepcopy(state)
-    identifier(request_id, "request ID")
+    require_id(request_id, "request ID")
     req = state["requests"].get(request_id)
     if not req or req.get("action") != "guide.generate" or req.get("status") != "running":
         raise OwlPilotError("Only an existing running guide request can be failed explicitly.")
-    req.update({"status": "failed", "error": text(message, "failure reason", 500), "completedAt": stamp()})
+    req.update({"status": "failed", "error": require_text(message, "failure reason", 500), "completedAt": utc_now()})
     state["domainRevision"] += 1
     check_budget(state)
     return {"status": "failed", "patch": merge_patch(before, state), "state": state, "ifRevision": it_revision,
@@ -668,11 +686,11 @@ def fail_request(document, request_id, message):
 def complete_guide(document, request_id, guide):
     state, it_revision = unpack_state(document)
     before = copy.deepcopy(state)
-    identifier(request_id, "request ID")
+    require_id(request_id, "request ID")
     req = state["requests"].get(request_id)
     if not req or req.get("action") != "guide.generate":
         raise OwlPilotError("Unknown guide request.")
-    result_hash = hashlib.sha256(encoded(guide)).hexdigest()
+    result_hash = hashlib.sha256(canonical_json(guide)).hexdigest()
     if req.get("status") == "succeeded":
         if req.get("resultHash") != result_hash:
             raise OwlPilotError("Completed request has a different result; refusing overwrite.")
@@ -680,7 +698,7 @@ def complete_guide(document, request_id, guide):
     if req.get("status") != "running":
         raise OwlPilotError("Request is not running; no automatic retry is allowed.")
     cid = req["courseId"]
-    if course(state, cid)["revision"] != req.get("courseRevision") or state["runtime"]["generation"] != req.get("generation"):
+    if get_course(state, cid)["revision"] != req.get("courseRevision") or state["runtime"]["generation"] != req.get("generation"):
         req["status"] = "stale"
         req["error"] = "Course evidence/mistakes or active consumer changed. Request a new guide explicitly."
         state["domainRevision"] += 1
@@ -688,9 +706,9 @@ def complete_guide(document, request_id, guide):
         return {"status": "stale", "patch": merge_patch(before, state), "state": state, "ifRevision": it_revision, "requestId": request_id, "domainRevision": state["domainRevision"]}
     clean = validate_guide(guide, state, cid)
     state["guides"][cid] = {**clean, "id": new_id("guide", request_id), "courseId": cid, "requestId": request_id,
-                           "courseRevision": req["courseRevision"], "generation": req["generation"], "agent": req["agent"], "generatedAt": stamp(), "stale": False,
+                           "courseRevision": req["courseRevision"], "generation": req["generation"], "agent": req["agent"], "generatedAt": utc_now(), "stale": False,
                            "sourceRevisions": {m["id"]: m["revision"] for m in state["materials"].values() if m["courseId"] == cid}}
-    req.update({"status": "succeeded", "completedAt": stamp(), "resultHash": result_hash})
+    req.update({"status": "succeeded", "completedAt": utc_now(), "resultHash": result_hash})
     state["domainRevision"] += 1
     check_budget(state)
     return {"status": "succeeded", "patch": merge_patch(before, state), "state": state, "ifRevision": it_revision, "requestId": request_id, "domainRevision": state["domainRevision"]}

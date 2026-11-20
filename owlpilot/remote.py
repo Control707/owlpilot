@@ -19,10 +19,8 @@ import subprocess
 import sys
 from urllib.parse import urlsplit, urlunsplit
 
-from .core import ROOT, OwlPilotError
+from .core import IT_BINARY, IT_HOME, OwlPilotError
 
-IT = ROOT / ".tools" / "it" / "bin" / "it"
-IT_HOME = str(ROOT / ".tools" / "it")
 PAGE_PATH = "/p/owlpilot"
 TAILSCALE_APP = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 
@@ -30,7 +28,7 @@ TAILSCALE_APP = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 def _run(args, timeout=60):
     try:
         return subprocess.run(args, capture_output=True, text=True, timeout=timeout,
-                              env={**os.environ, "IT_HOME": IT_HOME})
+                              env={**os.environ, "IT_HOME": str(IT_HOME)})
     except (OSError, subprocess.TimeoutExpired) as exc:
         return subprocess.CompletedProcess(args, 127, "", str(exc))
 
@@ -54,7 +52,7 @@ def _error(proc):
 
 
 def it(*args):
-    return _run([str(IT), *args])
+    return _run([str(IT_BINARY), *args])
 
 
 def tailscale_binary():

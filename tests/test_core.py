@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 from owlpilot.core import (OwlPilotError, STATE_LIMIT, initial_state, handle_action, complete_guide,
-                           guide_context, chunk_text, derive_priorities, merge_patch, check_budget, fail_request)
+                           guide_context, chunk_text, check_budget, fail_request)
 from owlpilot.__main__ import main
 
 

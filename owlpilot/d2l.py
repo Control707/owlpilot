@@ -30,7 +30,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .core import (ROOT, OwlPilotError, bump_course, check_budget, chunk_text, derive_priorities,
-                   encoded, merge_patch, save_material, stamp, unpack_state, validate_deadline)
+                   merge_patch, save_material, utc_now, unpack_state, validate_deadline, write_new_json)
 
 DATA = ROOT / "data" / "d2l"
 MISTAKE_THRESHOLD = 80  # graded items below this percentage enter the mistake log
@@ -63,7 +63,7 @@ class NeedsSetup(D2LError):
     pass
 
 
-def _lib():
+def _import_d2l_cli():
     """Import d2l-cli lazily so tests and the offline `apply` command work without it."""
     try:
         from d2l import auth, client, config, errors, schools
@@ -112,7 +112,7 @@ def _iso(value):
 def school_info():
     """Current school, without network access. Never includes credentials."""
     try:
-        auth, _client, config, _errors, schools = _lib()
+        auth, _client, config, _errors, schools = _import_d2l_cli()
     except D2LError as exc:
         return {"configured": False, "error": str(exc), "presets": []}
     host = config.get_lms_host(required=False)
@@ -126,7 +126,7 @@ def school_info():
 
 def setup_school(school=None, host=None):
     """Choose the Brightspace school by preset name or by URL. Only https URLs are accepted."""
-    _auth, _client, config, _errors, schools = _lib()
+    _auth, _client, config, _errors, schools = _import_d2l_cli()
     updates = {}
     if school:
         found = schools.find_school(str(school))
@@ -180,7 +180,7 @@ def login(timeout=LOGIN_TIMEOUT):
 
 
 def _token(refresh=True):
-    auth, _client_mod, config, errors, _schools = _lib()
+    auth, _client_mod, config, errors, _schools = _import_d2l_cli()
     if not config.get_lms_host(required=False):
         raise NeedsSetup("Choose your school first (Settings → School).")
     try:
@@ -194,7 +194,7 @@ def _token(refresh=True):
 
 
 def _client(refresh=True):
-    auth, client_mod, _config, _errors, _schools = _lib()
+    auth, client_mod, _config, _errors, _schools = _import_d2l_cli()
     return client_mod.D2LClient(auth.make_session(_token(refresh)))
 
 
@@ -225,7 +225,7 @@ def _current(enrollments, now):
 
 def collect(client=None, now=None, files=True):
     """Read-only snapshot through d2l-cli. A token that expires mid-sync is refreshed once."""
-    _auth, _client_mod, config, errors, _schools = _lib()
+    _auth, _client_mod, config, errors, _schools = _import_d2l_cli()
     try:
         return _collect(client or _client(), config, errors, now, files)
     except errors.TokenExpiredError:
@@ -266,7 +266,7 @@ def _collect(client, config, errors, now, files=True):
         courses.append(record)
     site = config.get_lms_host(required=False) or ""
     school = config.load_config().get("school") or ""
-    return {"syncedAt": stamp(), "site": site, "school": school, "timezone": local_timezone(),
+    return {"syncedAt": utc_now(), "site": site, "school": school, "timezone": local_timezone(),
             "user": _clean(who.get("FirstName"), 60), "courses": courses}
 
 
@@ -673,7 +673,7 @@ def apply_snapshot(document, snapshot, action_id=None, write_files=True):
                                "user": snapshot.get("user", ""), "courses": len(snapshot.get("courses", [])),
                                "unavailable": errors, "message": None}
     if action_id:
-        state["requests"][action_id] = {"id": action_id, "action": "d2l.sync", "status": "succeeded", "createdAt": stamp(),
+        state["requests"][action_id] = {"id": action_id, "action": "d2l.sync", "status": "succeeded", "createdAt": utc_now(),
                                         "courseId": None, "result": {"courses": len(snapshot.get("courses", []))}}
     state["domainRevision"] += 1
     state["priorities"] = derive_priorities(state)
@@ -738,11 +738,11 @@ def status_patch(document, status, reason, action_id=None, action="d2l.sync", ex
     state, it_revision = unpack_state(document)
     before = copy.deepcopy(state)
     state["runtime"]["d2l"] = {**state["runtime"].get("d2l", {}), **(extra or {}), "status": status,
-                               "message": _clean(reason, 300), "checkedAt": stamp()}
+                               "message": _clean(reason, 300), "checkedAt": utc_now()}
     if action_id:
         failed = status not in ("synced", "connected", "configured", "signing_in")
         state["requests"][action_id] = {"id": action_id, "action": action, "status": "failed" if failed else "succeeded",
-                                        "createdAt": stamp(), "courseId": None,
+                                        "createdAt": utc_now(), "courseId": None,
                                         **({"error": _clean(reason, 300)} if failed else {"result": {"status": status}})}
     state["domainRevision"] += 1
     return {"status": status, "patch": merge_patch(before, state), "ifRevision": it_revision}
@@ -768,20 +768,11 @@ def _load(path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
-def _write_new(path, value):
-    p = Path(path)
-    if p.exists():
-        raise OwlPilotError("Output already exists; choose a new filename.")
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("xb") as f:
-        f.write(encoded(value) + b"\n")
-
-
 def save_snapshot(snapshot):
     DATA.mkdir(parents=True, exist_ok=True)
     os.chmod(DATA, 0o700)
     path = DATA / f"snapshot-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.json"
-    _write_new(path, snapshot)
+    write_new_json(path, snapshot, reject_symlinked_parent=False)
     os.chmod(path, 0o600)
     return path
 
@@ -821,14 +812,14 @@ def main(argv=None):
             except (NeedsLogin, NeedsSetup) as exc:
                 status = "needs_setup" if isinstance(exc, NeedsSetup) else "needs_login"
                 result = status_patch(document, status, str(exc))
-                _write_new(args.out, result["patch"])
+                write_new_json(args.out, result["patch"], reject_symlinked_parent=False)
                 print(json.dumps({"status": status, "patchPath": str(Path(args.out).resolve()),
                                   "requiresItRevision": result["ifRevision"],
                                   "next": "Run `python -m owlpilot.d2l setup` / `login`, then sync again. Do not ack the action yet."}))
                 return 3
             save_snapshot(snapshot)
         result = apply_snapshot(document, snapshot, action_id)
-        _write_new(args.out, result["patch"])
+        write_new_json(args.out, result["patch"], reject_symlinked_parent=False)
         print(json.dumps({"status": result["status"], "patchPath": str(Path(args.out).resolve()),
                           "requiresItRevision": result["ifRevision"], "courses": result.get("courses"),
                           "unavailableSections": result.get("unavailable")}))

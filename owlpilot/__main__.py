@@ -4,8 +4,8 @@ import json
 import sys
 from pathlib import Path
 
-from .core import (ROOT, KEYS, OwlPilotError, initial_state, handle_action, complete_guide,
-                   guide_context, unpack_state, check_budget, encoded, prepare_material, fail_request)
+from .core import (ROOT, OwlPilotError, initial_state, handle_action, complete_guide,
+                   guide_context, check_budget, fail_request, write_new_json)
 
 
 def load(path):
@@ -18,18 +18,6 @@ def load(path):
         return json.loads(p.read_text(encoding="utf-8"), parse_constant=reject_constant)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise OwlPilotError(f"Cannot read valid JSON from {path}: {exc}") from exc
-
-
-def write_output(path, value):
-    p = Path(path)
-    # Writes only the explicit caller-selected output; refuses symlinks and existing files.
-    if p.is_symlink() or p.exists():
-        raise OwlPilotError("Output already exists; use a new patch/context filename.")
-    p.parent.mkdir(parents=True, exist_ok=True)
-    if p.parent.is_symlink():
-        raise OwlPilotError("Output parent must not be a symlink.")
-    with p.open("xb") as f:
-        f.write(encoded(value) + b"\n")
 
 
 def main(argv=None):
@@ -64,11 +52,11 @@ def main(argv=None):
         if args.command == "initial":
             state = initial_state(args.agent)
             check_budget(state)
-            write_output(args.out, state)
+            write_new_json(args.out, state)
             summary = {"status": "initial", "statePath": str(Path(args.out).resolve()), "domainRevision": 0}
         elif args.command == "context":
             result = guide_context(load(args.state), args.course, args.request)
-            write_output(args.out, result)
+            write_new_json(args.out, result)
             summary = {"status": "context", "contextPath": str(Path(args.out).resolve()), "courseId": args.course, "requestId": args.request}
         else:
             if args.command == "handle":
@@ -78,7 +66,7 @@ def main(argv=None):
                 result = fail_request(load(args.state), args.request, args.reason)
             else:
                 result = complete_guide(load(args.state), args.request, load(args.result))
-            write_output(args.out, result["patch"])
+            write_new_json(args.out, result["patch"])
             summary = {k: v for k, v in result.items() if k not in ("patch", "state", "context")}
             summary["patchPath"] = str(Path(args.out).resolve())
             summary["requiresItRevision"] = result["ifRevision"]

@@ -106,7 +106,7 @@ function requestRows(limit=50){const req=values(state.requests).sort((a,b)=>(b.c
 function activity(){const w=state.runtime?.worker;return heading('Transparent by design','Assistant activity','Everything OwlPilot has done for you, newest first.')+`<div class="three" style="margin-bottom:22px">${[['Assistant',workerUp()?'Online':'Offline',workerUp()?'Buttons are handled automatically':'Start it: python -m owlpilot.worker'],['Last D2L sync',state.runtime?.d2l?.syncedAt?fmtDate(state.runtime.d2l.syncedAt,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}):'Never',`Auto-sync every ${state.settings?.autoSyncHours||'—'} h`],['Actions recorded',values(state.requests).length,values(state.requests).filter(r=>r.status==='failed').length+' failed']].map(s=>`<div class="stat"><div class="stat-label">${s[0]}</div><strong style="font-size:22px">${esc(s[1])}</strong><p class="subtitle">${esc(s[2])}</p></div>`).join('')}</div><section class="card"><div class="card-head"><h2>History</h2></div><div class="pad">${requestRows(80)}</div></section>`}
 
 /* ---------- Approvals ---------- */
-function approvals(){return of('facts',null).length,values(state.facts).filter(f=>f.status==='candidate')}
+function approvals(){return values(state.facts).filter(f=>f.status==='candidate')}
 function approvalsPage(){const list=approvals();return heading('You decide','Approvals','Anything OwlPilot extracted from your own files waits here until you confirm it. D2L data is already authoritative.')+`<section class="card"><div class="card-head"><h2>Waiting for you</h2>${chip(list.length+' pending',list.length?'gold':'')}</div>${list.map(f=>`<div class="list-row"><small>${esc(short(course(f.courseId)))} · ${esc(f.kind)}</small><p style="margin:8px 0">${esc(typeof f.value==='object'?f.value.title:f.value)}</p>${sourceButtons(f.sourceIds)}<div class="actions"><button class="btn primary" data-fact="${esc(f.id)}" data-course="${esc(f.courseId)}" data-decision="confirmed">Approve</button><button class="btn" data-fact="${esc(f.id)}" data-course="${esc(f.courseId)}" data-decision="rejected">Reject</button></div></div>`).join('')||empty('Nothing waiting. OwlPilot only reads D2L and never takes actions there, so there is nothing else to approve.')}</section>`}
 
 /* ---------- Mistakes ---------- */
@@ -186,5 +186,5 @@ It.onState(next=>{const first=!loaded,prevRev=state.domainRevision,prevWorker=JS
  if(!course()||(first&&course()?.isSample)){const r=courses().filter(c=>!c.isSample);selected=(r[0]||courses()[0])?.id||''}
  if(prevRev!==state.domainRevision){sent={}}
  if(first||prevRev!==state.domainRevision||prevWorker!==JSON.stringify(state.runtime?.worker))render()});
-setInterval(()=>{if(loaded)render.call(null)},60000);render();
+setInterval(()=>{if(loaded)render()},60000);render();
 })();
